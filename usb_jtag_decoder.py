@@ -48,8 +48,9 @@ FtdiCommand = namedtuple('FtdiCommand', 'type flags opcode length data reply')
 
 class DecodeError(RuntimeError):
     """ Raised when a decoding error is found. """
-    def __init__(self, msg, last_byte=None):
+    def __init__(self, msg, commands, last_byte=None):
         RuntimeError.__init__(self, msg)
+        self.commands = commands
         self.last_byte = last_byte
 
     def get_last_byte(self):
@@ -72,7 +73,7 @@ def read_data(byte, ftdi_bytes, ftdi_replies):
         # Bitwise write
         number_of_bits = ftdi_bytes.popleft() + 1
         if number_of_bits > 7:
-            raise DecodeError('Bitwise clocking should only clock 7 or less bits, found {}'.format(number_of_bits))
+            raise DecodeError('Bitwise clocking should only clock 7 or less bits, found {}'.format(number_of_bits), commands=None, last_byte=byte)
 
         data = [ftdi_bytes.popleft()]
         reply = None
@@ -103,14 +104,20 @@ class Buffer(object):
     """
     def __init__(self):
         self.buf = []
+        self.insert_boundry = set()
         self.pop_index = 0
+        self.frames = {}
 
     def __len__(self):
         assert self.pop_index >= 0 and self.pop_index <= len(self.buf)
         return len(self.buf) - self.pop_index
 
-    def extend(self, iterable):
+    def extend(self, iterable, frame=None):
+        original_index = len(self.buf)
         self.buf.extend(iterable)
+        self.insert_boundry.add(len(self.buf))
+        if frame is not None:
+            self.frames[frame] = (original_index, len(self.buf))
 
     def popleft(self):
         assert self.pop_index >= 0 and self.pop_index <= len(self.buf)
@@ -120,6 +127,17 @@ class Buffer(object):
             return ret
         else:
             raise IndexError()
+
+    def at_boundry(self):
+        return self.pop_index in self.insert_boundry
+
+    def current_frame(self):
+        return self.frame_of(self.pop_index)
+
+    def frame_of(self, idx):
+        for frame, (begin, end) in self.frames.items():
+            if idx >= begin and idx < end:
+                return frame
 
     def get_context(self, C=10):
         """ Yield bytes before and after the current byte for context.
@@ -145,6 +163,7 @@ def decode_commands(ftdi_bytes, ftdi_replies):
             pass
 
         if HEX_DISPLAY:
+            command_opcode = hex(command_opcode)
             if data is not None:
                 data = tuple(hex(b) for b in data)
             if reply is not None:
@@ -162,14 +181,14 @@ def decode_commands(ftdi_bytes, ftdi_replies):
         byte = ftdi_bytes.popleft()
 
         if byte == 0xaa:
-            reply = [ftdi_bytes.popleft() for _ in range(2)]
+            reply = [ftdi_replies.popleft() for _ in range(2)]
             add_command(FtdiCommandType.UNKNOWN, byte, reply=reply)
         elif byte == 0xab:
-            reply = [ftdi_bytes.popleft() for _ in range(2)]
+            reply = [ftdi_replies.popleft() for _ in range(2)]
             add_command(FtdiCommandType.UNKNOWN, byte, reply=reply)
         elif byte & FtdiCommandType.CLOCK_TMS.value != 0:
             if byte & FtdiCommandType.CLOCK_TDI.value != 0:
-                raise DecodeError('When clocking TMS, cannot clock TDI?')
+                raise DecodeError('When clocking TMS, cannot clock TDI?', ftdi_commands, last_byte=byte)
 
             flags = get_write_flags(byte)
             length, data, reply = read_data(byte, ftdi_bytes, ftdi_replies)
@@ -183,7 +202,7 @@ def decode_commands(ftdi_bytes, ftdi_replies):
                     )
         elif byte & FtdiCommandType.CLOCK_TDI.value != 0:
             if byte & FtdiCommandType.CLOCK_TMS.value != 0:
-                raise DecodeError('When clocking TDI, cannot clock TMS?')
+                raise DecodeError('When clocking TDI, cannot clock TMS?', ftdi_commands, last_byte=byte)
 
             flags = get_write_flags(byte)
             length, data, reply = read_data(byte, ftdi_bytes, ftdi_replies)
@@ -206,12 +225,12 @@ def decode_commands(ftdi_bytes, ftdi_replies):
                 length = ftdi_bytes.popleft() + 1
 
                 if length > 7:
-                    raise DecodeError('Bitwise clocking should only clock 7 or less bits, found {}'.format(length))
+                    raise DecodeError('Bitwise clocking should only clock 7 or less bits, found {}'.format(length), ftdi_commands, last_byte=byte)
 
                 reply = [ftdi_replies.popleft()]
             else:
                 length = ftdi_bytes.popleft()
-                length = ftdi_bytes.popleft() << 8
+                length |= ftdi_bytes.popleft() << 8
                 length += 1
                 reply = [ftdi_replies.popleft() for _ in range(length)]
 
@@ -225,7 +244,7 @@ def decode_commands(ftdi_bytes, ftdi_replies):
         elif byte == FtdiCommandType.CLOCK_NO_DATA.value:
             flags = []
             length = ftdi_bytes.popleft()
-            length = ftdi_bytes.popleft() << 8
+            length |= ftdi_bytes.popleft() << 8
             length += 1
 
             add_command(
@@ -253,11 +272,15 @@ def decode_commands(ftdi_bytes, ftdi_replies):
             data |= ftdi_bytes.popleft() << 8
             add_command(FtdiCommandType.SET_DIVISOR, byte, data=[data])
         elif byte == FtdiCommandType.FLUSH.value:
+            if not ftdi_replies.at_boundry():
+                raise DecodeError('Should have a RX boundry in reply data?',
+                        ftdi_commands, last_byte=byte)
+
             add_command(FtdiCommandType.FLUSH, byte)
         elif byte == FtdiCommandType.DISABLE_DIV_BY_5.value:
             add_command(FtdiCommandType.DISABLE_DIV_BY_5, byte)
         else:
-            raise DecodeError('Unknown byte {}'.format(hex(byte)))
+            raise DecodeError('Unknown byte {}'.format(hex(byte)), ftdi_commands, last_byte=byte)
 
     return ftdi_commands
 
@@ -272,32 +295,56 @@ def main():
     ftdi_replies = Buffer()
     print('Loading data')
     with open(args.json_pcap) as f:
-        for cap in json.load(f):
+        for idx, cap in enumerate(json.load(f)):
             protocol = cap.get('_source', {}).get('layers', {}).get('frame', {}).get('frame.protocols')
             if protocol != 'usb:ftdift':
                 continue
 
             tx_data = cap.get('_source', {}).get('layers', {}).get('ftdift', {}).get('ftdift.if_a_tx_payload')
             if tx_data is not None:
-                ftdi_bytes.extend(int(byte, 16) for byte in tx_data.split(':'))
+                ftdi_bytes.extend((int(byte, 16) for byte in tx_data.split(':')), frame=idx+1)
 
             rx_data = cap.get('_source', {}).get('layers', {}).get('ftdift', {}).get('ftdift.if_a_rx_payload')
             if rx_data is not None:
-                ftdi_replies.extend(int(byte, 16) for byte in rx_data.split(':'))
+                ftdi_replies.extend((int(byte, 16) for byte in rx_data.split(':')), frame=idx+1)
 
     print('Parsing data')
     try:
         ftdi_commands = decode_commands(ftdi_bytes, ftdi_replies)
     except DecodeError as e:
         print('Failed decode at:', hex(e.get_last_byte()))
+        print('Next TX frame', ftdi_bytes.current_frame())
+        print('Next RX frame', ftdi_replies.current_frame())
         print('Context:')
         C = 50
         for offset, context_bytes in ftdi_bytes.get_context(C=C):
             print(offset+1, hex(context_bytes))
+
+        flush_count = 0
+        for idx, cmd in enumerate(e.commands[::-1]):
+            if cmd.type == FtdiCommandType.FLUSH:
+                flush_count += 1
+                if flush_count == 2:
+                    break
+
+        idx += 1
+
+        print('Last {} commands (2 flushes backward):'.format(idx))
+        for cmd in e.commands[-idx:]:
+            print(cmd)
         raise
 
-    #assert len(ftdi_replies) == 0, len(ftdi_replies)
-    print('Leftover reply bytes', len(ftdi_replies))
+    if not ftdi_replies.at_boundry():
+        print('RX frame:', ftdi_replies.current_frame())
+        print('Context:')
+        C = 50
+        for offset, context_bytes in ftdi_bytes.get_context(C=C):
+            print(offset+1, hex(context_bytes))
+        raise DecodeError('Leftover RX data.')
+
+
+    if len(ftdi_replies) != 0:
+        raise DecodeError('Leftover RX data, leftover = {}.'.format(len(ftdi_replies)), ftdi_commands)
 
     for idx, cmd in enumerate(ftdi_commands):
         print(cmd)
