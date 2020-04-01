@@ -3,7 +3,7 @@ from collections import namedtuple
 from enum import Enum
 import json
 
-HEX_DISPLAY = True
+HEX_DISPLAY = False
 
 class FtdiCommandType(Enum):
     # Command type is unknown
@@ -319,7 +319,8 @@ FTDI_MAX_PACKET_SIZE = 512
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--json_pcap')
+    parser.add_argument('--json_pcap', required=True, help='Input JSON PCAP data')
+    parser.add_argument('--ftdi_commands', help='Output of FTDI commands')
 
     args = parser.parse_args()
 
@@ -381,8 +382,23 @@ def main():
             print(cmd)
         raise
 
-    for idx, cmd in enumerate(ftdi_commands):
-        print(cmd)
+    if args.ftdi_commands:
+        print('Writing FTDI commands to disk')
+        with open(args.ftdi_commands, 'w') as f:
+            outputs = []
+            for cmd in ftdi_commands:
+                o = cmd._asdict()
+                o['type'] = cmd.type.name
+                if cmd.flags is not None:
+                    o['flags'] = [flag.name for flag in cmd.flags]
+
+                for k in cmd._asdict():
+                    if o[k] is None:
+                        del o[k]
+
+                outputs.append(o)
+
+            json.dump(outputs, f, indent=2)
 
 
 if __name__ == "__main__":
