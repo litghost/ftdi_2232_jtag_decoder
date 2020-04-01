@@ -43,7 +43,7 @@ class FtdiFlags(Enum):
     # Is TDI held high or low when clocking bits?
     TDI_HIGH = 0x80
 
-FtdiCommand = namedtuple('FtdiCommand', 'type flags opcode length data reply')
+FtdiCommand = namedtuple('FtdiCommand', 'type flags command_frame reply_frame opcode length data reply')
 
 
 class DecodeError(RuntimeError):
@@ -107,6 +107,8 @@ class Buffer(object):
         self.insert_boundry = set()
         self.pop_index = 0
         self.frames = {}
+        self.begin_to_frame = {}
+        self.frame = None
 
     def __len__(self):
         assert self.pop_index >= 0 and self.pop_index <= len(self.buf)
@@ -118,11 +120,28 @@ class Buffer(object):
         self.insert_boundry.add(len(self.buf))
         if frame is not None:
             self.frames[frame] = (original_index, len(self.buf))
+            self.begin_to_frame[original_index] = frame
 
     def popleft(self):
         assert self.pop_index >= 0 and self.pop_index <= len(self.buf)
         if self.pop_index < len(self.buf):
             ret = self.buf[self.pop_index]
+
+            # Update self.frame
+            if self.pop_index == 0:
+                self.frame = self.begin_to_frame[self.pop_index]
+
+                b, e = self.frames[self.frame]
+                assert self.pop_index == b
+            else:
+                b, e = self.frames[self.frame]
+                assert self.pop_index >= b
+                if self.pop_index >= e:
+                    self.frame = self.begin_to_frame[self.pop_index]
+
+                    b, e = self.frames[self.frame]
+                    assert self.pop_index == b
+
             self.pop_index += 1
             return ret
         else:
@@ -132,7 +151,7 @@ class Buffer(object):
         return self.pop_index in self.insert_boundry
 
     def current_frame(self):
-        return self.frame_of(self.pop_index)
+        return self.frame
 
     def frame_of(self, idx):
         for frame, (begin, end) in self.frames.items():
@@ -162,6 +181,12 @@ def decode_commands(ftdi_bytes, ftdi_replies):
             #    assert len(reply) == length
             pass
 
+        if reply is not None:
+            reply_frame = ftdi_replies.current_frame()
+        else:
+            reply_frame = None
+
+
         if HEX_DISPLAY:
             command_opcode = hex(command_opcode)
             if data is not None:
@@ -172,6 +197,8 @@ def decode_commands(ftdi_bytes, ftdi_replies):
         ftdi_commands.append(FtdiCommand(
             type=command_type,
             opcode=command_opcode,
+            command_frame=ftdi_bytes.current_frame(),
+            reply_frame=reply_frame,
             flags=flags,
             length=length,
             data=data,
@@ -282,7 +309,12 @@ def decode_commands(ftdi_bytes, ftdi_replies):
         else:
             raise DecodeError('Unknown byte {}'.format(hex(byte)), ftdi_commands, last_byte=byte)
 
+    if len(ftdi_replies) != 0:
+        raise DecodeError('Leftover RX data, leftover = {}.'.format(len(ftdi_replies)), ftdi_commands)
+
     return ftdi_commands
+
+FTDI_MAX_PACKET_SIZE = 512
 
 
 def main():
@@ -295,18 +327,32 @@ def main():
     ftdi_replies = Buffer()
     print('Loading data')
     with open(args.json_pcap) as f:
-        for idx, cap in enumerate(json.load(f)):
+        for frame_idx, cap in enumerate(json.load(f)):
             protocol = cap.get('_source', {}).get('layers', {}).get('frame', {}).get('frame.protocols')
             if protocol != 'usb:ftdift':
                 continue
 
             tx_data = cap.get('_source', {}).get('layers', {}).get('ftdift', {}).get('ftdift.if_a_tx_payload')
             if tx_data is not None:
-                ftdi_bytes.extend((int(byte, 16) for byte in tx_data.split(':')), frame=idx+1)
+                ftdi_bytes.extend((int(byte, 16) for byte in tx_data.split(':')), frame=frame_idx+1)
 
             rx_data = cap.get('_source', {}).get('layers', {}).get('ftdift', {}).get('ftdift.if_a_rx_payload')
             if rx_data is not None:
-                ftdi_replies.extend((int(byte, 16) for byte in rx_data.split(':')), frame=idx+1)
+
+                in_data = tuple(int(byte, 16) for byte in rx_data.split(':'))
+                idx = 0
+                out_data = []
+                while len(in_data) - idx >= FTDI_MAX_PACKET_SIZE:
+                    out_data.extend(in_data[idx:idx+FTDI_MAX_PACKET_SIZE])
+                    idx += FTDI_MAX_PACKET_SIZE
+                    # Modem status is next two bytes, skip them
+                    idx += 2
+
+                if idx < len(in_data):
+                    assert len(in_data) - idx < FTDI_MAX_PACKET_SIZE
+                    out_data.extend(in_data[idx:])
+
+                ftdi_replies.extend(out_data, frame=frame_idx+1)
 
     print('Parsing data')
     try:
@@ -320,6 +366,7 @@ def main():
         for offset, context_bytes in ftdi_bytes.get_context(C=C):
             print(offset+1, hex(context_bytes))
 
+        # Find previous two flushes to get sufficient context
         flush_count = 0
         for idx, cmd in enumerate(e.commands[::-1]):
             if cmd.type == FtdiCommandType.FLUSH:
@@ -333,18 +380,6 @@ def main():
         for cmd in e.commands[-idx:]:
             print(cmd)
         raise
-
-    if not ftdi_replies.at_boundry():
-        print('RX frame:', ftdi_replies.current_frame())
-        print('Context:')
-        C = 50
-        for offset, context_bytes in ftdi_bytes.get_context(C=C):
-            print(offset+1, hex(context_bytes))
-        raise DecodeError('Leftover RX data.')
-
-
-    if len(ftdi_replies) != 0:
-        raise DecodeError('Leftover RX data, leftover = {}.'.format(len(ftdi_replies)), ftdi_commands)
 
     for idx, cmd in enumerate(ftdi_commands):
         print(cmd)
