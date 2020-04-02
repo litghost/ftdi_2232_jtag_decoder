@@ -1,5 +1,5 @@
 import argparse
-from collections import namedtuple
+from collections import namedtuple, deque
 from enum import Enum
 import json
 
@@ -27,6 +27,7 @@ class FtdiCommandType(Enum):
     SET_DIVISOR = 0x86
     FLUSH = 0x87
     DISABLE_DIV_BY_5 = 0x8a
+    DISABLE_RCLK = 0x97
     # Run clock without changing TDI/TDO/TMS
     CLOCK_NO_DATA = 0x8f
 
@@ -213,6 +214,8 @@ def decode_commands(ftdi_bytes, ftdi_replies):
         elif byte == 0xab:
             reply = [ftdi_replies.popleft() for _ in range(2)]
             add_command(FtdiCommandType.UNKNOWN, byte, reply=reply)
+        elif byte == FtdiCommandType.DISABLE_RCLK.value:
+            add_command(FtdiCommandType.DISABLE_RCLK, byte)
         elif byte & FtdiCommandType.CLOCK_TMS.value != 0:
             if byte & FtdiCommandType.CLOCK_TDI.value != 0:
                 raise DecodeError('When clocking TMS, cannot clock TDI?', ftdi_commands, last_byte=byte)
@@ -314,8 +317,505 @@ def decode_commands(ftdi_bytes, ftdi_replies):
 
     return ftdi_commands
 
-FTDI_MAX_PACKET_SIZE = 512
 
+class JtagState(Enum):
+  RESET = 0
+  RUN_IDLE = 1
+  DRSELECT = 2
+  DRCAPTURE = 3
+  DRSHIFT = 4
+  DREXIT1 = 5
+  DRPAUSE = 6
+  DREXIT2 = 7
+  DRUPDATE = 9
+  IRSELECT = 10
+  IRCAPTURE = 11
+  IRSHIFT = 12
+  IREXIT1 = 13
+  IRPAUSE = 14
+  IREXIT2 = 15
+  IRUPDATE = 16
+
+
+# JtagState, TMS -> JtagState
+JTAG_STATE_TABLE = {
+        (JtagState.RESET, 1): JtagState.RESET,
+        (JtagState.RESET, 0): JtagState.RUN_IDLE,
+        (JtagState.RUN_IDLE, 0): JtagState.RUN_IDLE,
+        (JtagState.RUN_IDLE, 1): JtagState.DRSELECT,
+        # DR chain
+        (JtagState.DRSELECT, 0): JtagState.DRCAPTURE,
+        (JtagState.DRSELECT, 1): JtagState.IRSELECT,
+        (JtagState.DRCAPTURE, 0): JtagState.DRSHIFT,
+        (JtagState.DRCAPTURE, 1): JtagState.DREXIT1,
+        (JtagState.DRSHIFT, 0): JtagState.DRSHIFT,
+        (JtagState.DRSHIFT, 1): JtagState.DREXIT1,
+        (JtagState.DREXIT1, 0): JtagState.DRPAUSE,
+        (JtagState.DREXIT1, 1): JtagState.DRUPDATE,
+        (JtagState.DRPAUSE, 0): JtagState.DRPAUSE,
+        (JtagState.DRPAUSE, 1): JtagState.DREXIT2,
+        (JtagState.DREXIT2, 0): JtagState.DRSHIFT,
+        (JtagState.DREXIT2, 1): JtagState.DRUPDATE,
+        (JtagState.DRUPDATE, 0): JtagState.RUN_IDLE,
+        (JtagState.DRUPDATE, 1): JtagState.DRSELECT,
+        # IR chain
+        (JtagState.IRSELECT, 0): JtagState.IRCAPTURE,
+        (JtagState.IRSELECT, 1): JtagState.RESET,
+        (JtagState.IRCAPTURE, 0): JtagState.IRSHIFT,
+        (JtagState.IRCAPTURE, 1): JtagState.IREXIT1,
+        (JtagState.IRSHIFT, 0): JtagState.IRSHIFT,
+        (JtagState.IRSHIFT, 1): JtagState.IREXIT1,
+        (JtagState.IREXIT1, 0): JtagState.IRPAUSE,
+        (JtagState.IREXIT1, 1): JtagState.IRUPDATE,
+        (JtagState.IRPAUSE, 0): JtagState.IRPAUSE,
+        (JtagState.IRPAUSE, 1): JtagState.IREXIT2,
+        (JtagState.IREXIT2, 0): JtagState.IRSHIFT,
+        (JtagState.IREXIT2, 1): JtagState.IRUPDATE,
+        (JtagState.IRUPDATE, 0): JtagState.RUN_IDLE,
+        (JtagState.IRUPDATE, 1): JtagState.DRSELECT,
+        }
+
+class ShiftRegister(object):
+    def __init__(self, width):
+        self.data = deque()
+        self.width = width
+
+        for _ in range(width):
+            self.data.append(0)
+
+    def shift(self, di):
+        do = self.data.popleft()
+        self.data.append(int(di))
+        return do
+
+    def load(self, data):
+        for idx in range(self.width):
+            self.data[idx] = 1 if (data & (1 << idx)) != 0 else 0
+
+    def read(self):
+        data = 0
+        for idx, bit in enumerate(self.data):
+            if bit:
+                data |= (1 << idx)
+
+        return data
+
+
+class DrState(Enum):
+    BYPASS = 0
+    IDCODE = 1
+    JTAG_CTRL = 2
+    JTAG_STATUS = 3
+
+
+class UscaleDapModel(object):
+    def __init__(self):
+        self.ir = ShiftRegister(4)
+        self.dr = None
+
+        # DAP states in BYPASS until enabled
+        self.dap_state = DrState.BYPASS
+
+        self.will_enable = False
+        self.enabled = False
+
+    def shift_dr(self, tdi):
+        """ DR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
+        return self.dr.shift(tdi)
+
+    def shift_ir(self, tdi):
+        """ IR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
+        return self.ir.shift(tdi)
+
+    def update_dr(self):
+        """ DR update state has been entered. """
+        dr = self.dr.read()
+        print('DAP TAP state = {} DR = 0x{:08x}'.format(self.dap_state, dr))
+        pass
+
+    def capture_ir(self):
+        """ IR update state has been entered. """
+        print('ARM DAP TAP IR = 0x01')
+        self.ir.load(0x01)
+
+    def capture_dr(self):
+        """ DR capture state has been entered. """
+        print('DAP TAP state = {}'.format(self.dap_state))
+        if self.dap_state == DrState.BYPASS:
+            self.dr = ShiftRegister(1)
+            self.dr.load(0x0)
+        elif self.dap_state == DrState.IDCODE:
+            self.dr = ShiftRegister(32)
+            self.dr.load(0x5ba00477)
+        else:
+            assert False, self.dap_state
+
+    def update_ir(self):
+        """ IR capture state has been entered. """
+        ir = self.ir.read()
+        if self.enable:
+            if ir == 0x1:
+                # ABORT?
+                pass
+            elif ir == 0b1010:
+                # DPACC
+                pass
+            elif ir == 0b1011:
+                # APACC
+                pass
+            elif ir == 0b1110:
+                # IDCODE
+                self.dap_state = DrState.IDCODE
+            else:
+                # All other IR's are BYPASS
+                self.dap_state = DrState.BYPASS
+        else:
+            self.dap_state = DrState.BYPASS
+
+        print('ARM TAP IR = 0x{:02x}, state = {}'.format(ir, self.dap_state))
+
+    def reset(self):
+        if self.will_enable:
+            self.enable = True
+            self.dap_state = DrState.IDCODE
+        else:
+            self.enable = False
+            self.dap_state = DrState.BYPASS
+
+    def set_enable(self, enable):
+        self.will_enable = enable
+
+
+class UscalePsModel(object):
+    def __init__(self, dap_model):
+        self.dap_model = dap_model
+        self.ir = ShiftRegister(12)
+        self.dr = None
+        self.dr_state = DrState.IDCODE
+
+    def shift_dr(self, tdi):
+        """ DR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
+        return self.dr.shift(tdi)
+
+    def shift_ir(self, tdi):
+        """ IR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
+        return self.ir.shift(tdi)
+
+    def update_dr(self):
+        """ DR update state has been entered. """
+        dr = self.dr.read()
+        print('PS TAP state = {} DR = 0x{:08x}'.format(self.dr_state, dr))
+        if self.dr_state == DrState.JTAG_CTRL:
+            if dr & 0x2:
+                self.dap_model.set_enable(True)
+
+    def capture_ir(self):
+        """ IR update state has been entered. """
+        print('PS TAP IR = 0x01')
+        self.ir.load(0x51)
+
+    def capture_dr(self):
+        """ DR capture state has been entered. """
+        print('PS TAP state = {}'.format(self.dr_state))
+        if self.dr_state == DrState.BYPASS:
+            self.dr = ShiftRegister(1)
+            self.dr.load(0x1)
+        elif self.dr_state == DrState.IDCODE:
+            self.dr = ShiftRegister(32)
+            self.dr.load(0x14710093)
+        elif self.dr_state == DrState.JTAG_CTRL:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.JTAG_STATUS:
+            self.dr = ShiftRegister(32)
+            # TODO: This is static!
+            self.dr.load(0x6000467a)
+        else:
+            assert False, self.dr_state
+
+    def update_ir(self):
+        """ IR update state has been entered. """
+        raw_ir = self.ir.read()
+        ir = (raw_ir >> 6)
+        if ir == 0x00:
+            # Reserved
+            assert False, hex(ir)
+        elif ir == 0x03:
+            # PMU_MDM
+            assert False, hex(ir)
+        elif ir == 0x08:
+            # USERCODE
+            assert False, hex(ir)
+        elif ir == 0x09:
+            # IDCODE
+            self.dr_state = DrState.IDCODE
+        elif ir == 0x0A:
+            # HIGHZ
+            assert False, hex(ir)
+        elif ir == 0x19:
+            # IP_DISABLE
+            assert False, hex(ir)
+        elif ir == 0x1F:
+            # JTAG_STATUS
+            self.dr_state = DrState.JTAG_STATUS
+        elif ir == 0x20:
+            self.dr_state = DrState.JTAG_CTRL
+        elif ir == 0x26:
+            # EXTEST
+            assert False, hex(ir)
+        elif ir == 0x26:
+            # EXTEST
+            assert False, hex(ir)
+        elif ir == 0x3F:
+            self.dr_state = DrState.BYPASS
+        else:
+            assert False, hex(ir)
+
+        print('PS TAP IR = 0x{:02x}, state = {}'.format(ir, self.dr_state))
+
+    def reset(self):
+        self.dr_state = DrState.IDCODE
+
+
+class JtagBypassModel(object):
+    def __init__(self):
+        pass
+
+    def shift_dr(self, tdi):
+        """ DR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
+        return tdi
+
+    def shift_ir(self, tdi):
+        """ IR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
+        return tdi
+
+    def update_dr(self):
+        """ DR update state has been entered. """
+        pass
+
+    def update_ir(self):
+        """ IR update state has been entered. """
+        pass
+
+    def capture_dr(self):
+        """ DR capture state has been entered. """
+        pass
+
+    def capture_ir(self):
+        """ IR capture state has been entered. """
+        pass
+
+    def reset(self):
+        pass
+
+
+class JtagChain(object):
+    def __init__(self, models):
+        assert len(models) > 0
+        self.models = models
+
+    def shift_dr(self, tdi):
+        for model in self.models:
+            tdo = model.shift_dr(tdi)
+            # Chain to next part.
+            tdi = tdo
+
+        return tdo
+
+    def shift_ir(self, tdi):
+        for model in self.models:
+            tdo = model.shift_ir(tdi)
+            # Chain to next part.
+            tdi = tdo
+
+        return tdo
+
+    def update_dr(self):
+        """ DR update state has been entered. """
+        for model in self.models:
+            model.update_dr()
+
+    def update_ir(self):
+        """ DR update state has been entered. """
+        for model in self.models:
+            model.update_ir()
+
+    def capture_dr(self):
+        """ DR update state has been entered. """
+        for model in self.models:
+            model.capture_dr()
+
+    def capture_ir(self):
+        """ DR update state has been entered. """
+        for model in self.models:
+            model.capture_ir()
+
+    def reset(self):
+        """ Reset state has been entered. """
+        for model in self.models:
+            model.reset()
+
+
+class JtagFsm(object):
+    def __init__(self, jtag_model):
+        self.state = JtagState.RESET
+        self.jtag_model = jtag_model
+        self.last_tdo = 1
+        self.pins_locked = True
+
+    def get_state(self):
+        return self.state
+
+    def lock(self):
+        self.pins_locked = True
+
+    def unlock(self):
+        self.pins_locked = False
+
+    def clock(self, tdi, tms):
+        assert not self.pins_locked
+        next_state = JTAG_STATE_TABLE[self.state, tms]
+        print(self.state, tdi)
+
+        if self.state == JtagState.RESET:
+            self.jtag_model.reset()
+        elif self.state == JtagState.DRSHIFT:
+            self.last_tdo = self.jtag_model.shift_dr(tdi)
+        elif self.state == JtagState.DRUPDATE:
+            self.jtag_model.update_dr()
+        elif self.state == JtagState.DRCAPTURE:
+            self.jtag_model.capture_dr()
+        elif self.state == JtagState.IRSHIFT:
+            self.last_tdo = self.jtag_model.shift_ir(tdi)
+        elif self.state == JtagState.IRUPDATE:
+            self.jtag_model.update_ir()
+        elif self.state == JtagState.IRCAPTURE:
+            self.jtag_model.capture_ir()
+
+        self.state = next_state
+
+        return self.last_tdo
+
+TCK = 0
+TDI = 1
+TDO = 2
+TMS = 3
+
+def run_ftdi_command(command, jtag_fsm):
+    output = []
+
+    if command.type == FtdiCommandType.CLOCK_TMS:
+        assert FtdiFlags.LSB_FIRST in command.flags
+        assert FtdiFlags.NEG_EDGE_OUT in command.flags
+        assert FtdiFlags.BITWISE in command.flags
+
+        reading = (command.opcode & FtdiCommandType.CLOCK_TDO.value != 0)
+        if reading:
+            assert FtdiFlags.NEG_EDGE_IN in command.flags
+
+        assert command.length <= 7
+        tdi = 1 if command.data[0] & 0x80 != 0 else 0
+        for bit in range(command.length):
+            tms = 1 if (command.data[0] & (1 << bit)) != 0 else 0
+            tdo = jtag_fsm.clock(tdi=tdi, tms=tms)
+            if reading:
+                output.append(tdo)
+    elif command.type == FtdiCommandType.CLOCK_TDI:
+        assert FtdiFlags.LSB_FIRST in command.flags
+        assert FtdiFlags.NEG_EDGE_OUT in command.flags
+
+        reading = (command.opcode & FtdiCommandType.CLOCK_TDO.value != 0)
+        if reading:
+            assert FtdiFlags.NEG_EDGE_IN in command.flags
+
+        # TMS is always low when clocking data?
+        tms = 0
+
+        if FtdiFlags.BITWISE in command.flags:
+            assert command.length <= 7
+
+            for bit in range(command.length):
+                tdi = 1 if (command.data[0] & (1 << bit)) != 0 else 0
+                tdo = jtag_fsm.clock(tdi=tdi, tms=tms)
+
+                if reading:
+                    output.append(tdo)
+        else:
+            for byte in command.data:
+                for bit in range(8):
+                    tdi = 1 if (byte & (1 << bit)) != 0 else 0
+                    tdo = jtag_fsm.clock(tdi=tdi, tms=tms)
+
+                    if reading:
+                        output.append(tdo)
+    elif command.type == FtdiCommandType.CLOCK_TDO:
+        assert FtdiFlags.LSB_FIRST in command.flags
+        assert FtdiFlags.NEG_EDGE_IN in command.flags
+
+        # TDI is 1 when clocking TDO?
+        tdi = 1
+
+        # TMS is always low when clocking data?
+        tms = 0
+
+        if FtdiFlags.BITWISE in command.flags:
+            assert command.length <= 7
+
+            for bit in range(command.length):
+                tdo = jtag_fsm.clock(tdi=tdi, tms=tms)
+                output.append(tdo)
+        else:
+            for _ in range(command.length):
+                for _ in range(8):
+                    tdo = jtag_fsm.clock(tdi=tdi, tms=tms)
+                    output.append(tdo)
+
+    elif command.type == FtdiCommandType.SET_GPIO_LOW_BYTE:
+        data, direction = command.data
+
+        # Inputs
+        if direction == 0:
+            assert jtag_fsm.get_state() in [JtagState.RUN_IDLE, JtagState.RESET]
+            jtag_fsm.lock()
+            return
+
+        assert (direction & (1 << TCK)) != 0, (hex(data), hex(direction))
+        assert (direction & (1 << TDI)) != 0, (hex(data), hex(direction))
+        assert (direction & (1 << TMS)) != 0, (hex(data), hex(direction))
+
+        # Outputs
+        assert (direction & (1 << TDO)) == 0, (hex(data), hex(direction))
+
+        assert (data & (1 << TCK)) == 0, (hex(data), hex(direction))
+        assert (data & (1 << TDI)) == 0, (hex(data), hex(direction))
+        assert (data & (1 << TMS)) != 0, (hex(data), hex(direction))
+        jtag_fsm.unlock()
+    elif command.type == FtdiCommandType.CLOCK_NO_DATA:
+        pass
+
+    output_bytes = []
+    itr = iter(output)
+    bit_offset = 0
+    byte = 0
+    while True:
+        try:
+            bit = next(itr)
+            if bit:
+                byte |= 1 << bit_offset
+
+            bit_offset += 1
+            if bit_offset == 8:
+                output_bytes.append(byte)
+                bit_offset = 0
+                byte = 0
+        except StopIteration:
+            if bit_offset > 0:
+                output_bytes.append(byte)
+
+            break
+
+    return output_bytes
+
+FTDI_MAX_PACKET_SIZE = 512
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -368,18 +868,19 @@ def main():
             print(offset+1, hex(context_bytes))
 
         # Find previous two flushes to get sufficient context
-        flush_count = 0
-        for idx, cmd in enumerate(e.commands[::-1]):
-            if cmd.type == FtdiCommandType.FLUSH:
-                flush_count += 1
-                if flush_count == 2:
-                    break
+        if e.commands is not None:
+            flush_count = 0
+            for idx, cmd in enumerate(e.commands[::-1]):
+                if cmd.type == FtdiCommandType.FLUSH:
+                    flush_count += 1
+                    if flush_count == 2:
+                        break
 
-        idx += 1
+            idx += 1
 
-        print('Last {} commands (2 flushes backward):'.format(idx))
-        for cmd in e.commands[-idx:]:
-            print(cmd)
+            print('Last {} commands (2 flushes backward):'.format(idx))
+            for cmd in e.commands[-idx:]:
+                print(cmd)
         raise
 
     if args.ftdi_commands:
@@ -399,6 +900,27 @@ def main():
                 outputs.append(o)
 
             json.dump(outputs, f, indent=2)
+
+    dap_model = UscaleDapModel()
+    ps_model = UscalePsModel(dap_model)
+    jtag_model = JtagChain(models=[ps_model, dap_model])
+    jtag_fsm = JtagFsm(jtag_model)
+
+    for cmd in ftdi_commands[:1000]:
+        print('{:24s} opcode=0x{:02x} cf={: 8d} l={}'.format(
+            cmd.type.name,
+            cmd.opcode,
+            cmd.command_frame,
+            cmd.length))
+        if cmd.flags is not None:
+            print('Flags: [{}]'.format(', '.join(flag.name for flag in cmd.flags)))
+        if cmd.data is not None:
+            print('Command: {}'.format(':'.join('{:02x}'.format(b) for b in cmd.data)))
+
+        output = run_ftdi_command(cmd, jtag_fsm)
+        if cmd.reply is not None:
+            print('Real Reply(rf={: 8d}): {}'.format(cmd.reply_frame, ':'.join('{:02x}'.format(b) for b in cmd.reply)))
+            print(' Sim Reply    {:8s} : {}'.format('', ':'.join('{:02x}'.format(b) for b in output)))
 
 
 if __name__ == "__main__":
