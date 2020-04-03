@@ -3,7 +3,11 @@ from collections import namedtuple, deque
 from enum import Enum
 import json
 
+
+FTDI_MAX_PACKET_SIZE = 512
 HEX_DISPLAY = False
+DEBUG_JTAG_SIM = False
+
 
 class FtdiCommandType(Enum):
     # Command type is unknown
@@ -401,6 +405,23 @@ class ShiftRegister(object):
         return data
 
 
+class SinkRegister(object):
+    """ Represents a DR that simply sinks the clocked in data forever.
+
+    The CFG_IN register uses this type to forward the input bitstream directly
+    to the configuration engine.
+    """
+    def __init__(self):
+        self.data = []
+
+    def shift(self, di):
+        self.data.append(di)
+        return 0
+
+    def read(self):
+        return self.data
+
+
 class DrState(Enum):
     BYPASS = 0
     IDCODE = 1
@@ -410,7 +431,7 @@ class DrState(Enum):
     DPACC = 5
     APACC = 6
     PS_IDCODE_DEVICE_ID = 7
-    PMU_MBM = 8
+    PMU_MDM = 8
     ERROR_STATUS = 9
     IP_DISABLE = 10
     UNKNOWN_STATE_9FF = 11
@@ -422,6 +443,7 @@ class DrState(Enum):
     CFG_IN = 17
     JPROGRAM = 18
     ISC_NOOP = 19
+    FUSE_DNA = 20
 
 
 class UscaleDapModel(object):
@@ -433,7 +455,7 @@ class UscaleDapModel(object):
         # DAP states in BYPASS until enabled
         self.dap_state = DrState.BYPASS
 
-        self.will_enable = False
+        self.will_enable = True
         self.enabled = False
 
     def shift_dr(self, tdi):
@@ -451,12 +473,14 @@ class UscaleDapModel(object):
 
     def capture_ir(self):
         """ IR update state has been entered. """
-        print('ARM DAP TAP IR = 0x01')
+        if DEBUG_JTAG_SIM:
+            print('ARM DAP TAP IR = 0x01')
         self.ir.load(0x01)
 
     def capture_dr(self):
         """ DR capture state has been entered. """
-        print('DAP TAP state = {}'.format(self.dap_state))
+        if DEBUG_JTAG_SIM:
+            print('DAP TAP state = {}'.format(self.dap_state))
         if self.dap_state == DrState.BYPASS:
             self.dr = ShiftRegister(1)
             self.dr.load(0x0)
@@ -476,7 +500,7 @@ class UscaleDapModel(object):
         """ IR capture state has been entered. """
         ir = self.ir.read()
         if self.enable:
-            if ir == 0x1:
+            if ir == 0b1000:
                 self.dap_state = DrState.ABORT
             elif ir == 0b1010:
                 self.dap_state = DrState.DPACC
@@ -489,13 +513,12 @@ class UscaleDapModel(object):
             elif ir == 0b1111:
                 self.dap_state = DrState.BYPASS
             else:
-                # All other IR's are BYPASS
-                print('ARM TAP IR *** UNKNOWN! ***, setting BYPASS')
-                self.dap_state = DrState.BYPASS
+                assert False, hex(ir)
         else:
             self.dap_state = DrState.BYPASS
 
-        print('ARM TAP IR = 0x{:01x}, state = {}'.format(ir, self.dap_state))
+        if DEBUG_JTAG_SIM:
+            print('ARM TAP IR = 0x{:01x}, state = {}'.format(ir, self.dap_state))
 
     def reset(self):
         if self.will_enable:
@@ -538,12 +561,15 @@ class UscalePsModel(object):
 
     def capture_ir(self):
         """ IR update state has been entered. """
-        print('PS TAP IR = 0x01')
+        if DEBUG_JTAG_SIM:
+            print('PS TAP IR = 0x01')
         self.ir.load(0x51)
 
     def capture_dr(self):
         """ DR capture state has been entered. """
-        print('PS TAP state = {}'.format(self.dr_state))
+        if DEBUG_JTAG_SIM:
+            print('PS TAP state = {}'.format(self.dr_state))
+
         if self.dr_state == DrState.BYPASS:
             self.dr = ShiftRegister(1)
             self.dr.load(0x1)
@@ -554,55 +580,103 @@ class UscalePsModel(object):
             self.dr = ShiftRegister(32)
         elif self.dr_state == DrState.JTAG_STATUS:
             self.dr = ShiftRegister(32)
-            # TODO: This is static!
-            self.dr.load(0x6000467a)
+        elif self.dr_state == DrState.PS_IDCODE_DEVICE_ID:
+            self.dr = ShiftRegister(64)
+            self.dr.load((0x14710093 << 32) | 0x0)
+        elif self.dr_state == DrState.IP_DISABLE:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.USER1:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.USER2:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.USER3:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.USER4:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.CFG_OUT:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.CFG_IN:
+            self.dr = SinkRegister()
+        elif self.dr_state == DrState.JPROGRAM:
+            # No DRCAPTURE with ISC_NOOP
+            assert False, self.dr_state
+        elif self.dr_state == DrState.ISC_NOOP:
+            # No DRCAPTURE with ISC_NOOP
+            assert False, self.dr_state
+        elif self.dr_state == DrState.PMU_MDM:
+            self.dr = ShiftRegister(32)
+        elif self.dr_state == DrState.ERROR_STATUS:
+            self.dr = ShiftRegister(121)
+        elif self.dr_state == DrState.FUSE_DNA:
+            self.dr = ShiftRegister(1)
         else:
             assert False, self.dr_state
 
     def update_ir(self):
         """ IR update state has been entered. """
         raw_ir = self.ir.read()
-        print('PS TAP, raw IR = 0x{:03x} High 6: 0x{:02x} Low 6: 0x{:02x}'.format(
-            raw_ir, (raw_ir >> 6) & 0x3f, raw_ir & 0x3f))
-        self.captured_ir = raw_ir
-        ir = (raw_ir >> 6) & 0x3f
-        if False:
-            pass
-        #if ir == 0x00:
-        #    # Reserved
-        #    assert False, hex(ir)
-        #elif ir == 0x03:
-        #    # PMU_MDM
-        #    assert False, hex(ir)
-        #elif ir == 0x08:
-        #    # USERCODE
-        #    assert False, hex(ir)
-        elif ir == 0x09:
-            # IDCODE
-            self.dr_state = DrState.IDCODE
-        #elif ir == 0x0A:
-        #    # HIGHZ
-        #    assert False, hex(ir)
-        #elif ir == 0x19:
-        #    # IP_DISABLE
-        #    assert False, hex(ir)
-        elif ir == 0x1F:
-            # JTAG_STATUS
-            self.dr_state = DrState.JTAG_STATUS
-        elif ir == 0x20:
-            self.dr_state = DrState.JTAG_CTRL
-        elif ir == 0x24:
-            print('PS TAP, weird JTAG_CTRL???')
-            self.dr_state = DrState.JTAG_CTRL
-        #elif ir == 0x26:
-        #    # EXTEST
-        #    assert False, hex(ir)
-        elif ir == 0x3F:
-            self.dr_state = DrState.BYPASS
-        else:
-            self.dr_state = DrState.BYPASS
+        if DEBUG_JTAG_SIM:
+            print('PS TAP, raw IR = 0x{:03x} High 6: 0x{:02x} Low 6: 0x{:02x}'.format(
+                raw_ir, (raw_ir >> 6) & 0x3f, raw_ir & 0x3f))
 
-        print('PS TAP IR = 0x{:03x}, state = {}'.format(ir, self.dr_state))
+        self.captured_ir = raw_ir
+        ps_ir = (raw_ir >> 6) & 0x3f
+        pl_ir = raw_ir & 0x3f
+
+        if ps_ir == 0x9 and pl_ir == 0x9:
+            self.dr_state = DrState.PS_IDCODE_DEVICE_ID
+        elif ps_ir == 0x3f and pl_ir == 0x3f:
+            self.dr_state = DrState.BYPASS
+        elif ps_ir == 0x19 and pl_ir == 0x3f:
+            self.dr_state = DrState.IP_DISABLE
+        elif ps_ir == 0x27 and pl_ir == 0x3f:
+            # This state is entered in the IR, but DRCAPTURE is never entered
+            # with this IR.
+            self.dr_state = DrState.UNKNOWN_STATE_9FF
+        elif ps_ir == 0x24:
+            # PL in control
+            # Table 6-3 UltraScale FPGA Boundary-Scan Instructions from UG570
+            # Page 97
+            if pl_ir == 0b000010:
+                self.dr_state = DrState.USER1
+            elif pl_ir == 0b000011:
+                self.dr_state = DrState.USER2
+            elif pl_ir == 0b000100:
+                self.dr_state = DrState.CFG_OUT
+            elif pl_ir == 0b000101:
+                self.dr_state = DrState.CFG_IN
+            elif pl_ir == 0b001011:
+                self.dr_state = DrState.JPROGRAM
+            elif pl_ir == 0b010100:
+                self.dr_state = DrState.ISC_NOOP
+            elif pl_ir == 0b100010:
+                self.dr_state = DrState.USER3
+            elif pl_ir == 0b100011:
+                self.dr_state = DrState.USER4
+            elif pl_ir == 0b110010:
+                self.dr_state = DrState.FUSE_DNA
+            else:
+                assert False, hex(pl_ir)
+        elif pl_ir == 0x24:
+            # PS in control
+            # Table 39-4 PS TAP Controller Instructions
+            if ps_ir == 0x03:
+                self.dr_state = DrState.PMU_MDM
+            elif ps_ir == 0x19:
+                self.dr_state = DrState.IP_DISABLE
+            elif ps_ir == 0x1f:
+                self.dr_state = DrState.JTAG_STATUS
+            elif ps_ir == 0x20:
+                self.dr_state = DrState.JTAG_CTRL
+            elif ps_ir == 0x3e:
+                self.dr_state = DrState.ERROR_STATUS
+            else:
+                assert False, hex(ps_ir)
+        else:
+            assert False, (hex(raw_ir), hex(ps_ir), hex(pl_ir))
+
+        if DEBUG_JTAG_SIM:
+            print('PS TAP IR = 0x{:03x}, state = {}'.format(raw_ir, self.dr_state))
 
     def reset(self):
         self.dr_state = DrState.IDCODE
@@ -707,7 +781,8 @@ class JtagFsm(object):
     def clock(self, tdi, tms):
         assert not self.pins_locked
         next_state = JTAG_STATE_TABLE[self.state, tms]
-        print(self.state, tdi)
+        if DEBUG_JTAG_SIM:
+            print(self.state, tdi)
 
         if self.state == JtagState.RESET:
             self.jtag_model.reset()
@@ -732,6 +807,26 @@ TCK = 0
 TDI = 1
 TDO = 2
 TMS = 3
+
+def bits_to_bytes(in_bits):
+    itr = iter(in_bits)
+    bit_offset = 0
+    byte = 0
+    while True:
+        try:
+            bit = next(itr)
+            if bit:
+                byte |= 1 << bit_offset
+
+            bit_offset += 1
+            if bit_offset == 8:
+                yield byte
+                bit_offset = 0
+                byte = 0
+        except StopIteration:
+            if bit_offset > 0:
+                yield byte
+            break
 
 def run_ftdi_command(command, jtag_fsm):
     output = []
@@ -825,30 +920,8 @@ def run_ftdi_command(command, jtag_fsm):
     elif command.type == FtdiCommandType.CLOCK_NO_DATA:
         pass
 
-    output_bytes = []
-    itr = iter(output)
-    bit_offset = 0
-    byte = 0
-    while True:
-        try:
-            bit = next(itr)
-            if bit:
-                byte |= 1 << bit_offset
+    return tuple(bits_to_bytes(output))
 
-            bit_offset += 1
-            if bit_offset == 8:
-                output_bytes.append(byte)
-                bit_offset = 0
-                byte = 0
-        except StopIteration:
-            if bit_offset > 0:
-                output_bytes.append(byte)
-
-            break
-
-    return output_bytes
-
-FTDI_MAX_PACKET_SIZE = 512
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -935,16 +1008,28 @@ def main():
             json.dump(outputs, f, indent=2)
 
     def dap_callback(dr_state, dr_value):
-        print('ARM DAP TAP state = {} DR = 0x{:09x}'.format(dr_state, dr_value))
+        if dr_state != DrState.BYPASS:
+            print('ARM DAP TAP state = {} DR = 0x{:09x}'.format(dr_state, dr_value))
 
     def ps_callback(dr_state, ir_value, dr_value):
-        print('PS TAP state = {} DR = 0x{:08x}'.format(dr_state, dr_value))
-        if ir_value is not None:
-            print('PS TAP, raw IR = 0x{:03x} High 6: 0x{:02x} Low 6: 0x{:02x}'.format(
-                ir_value,
-                (ir_value >> 6) & 0x3f,
-                ir_value & 0x3f))
+        if dr_state == DrState.BYPASS:
+            return
+        elif dr_state != DrState.CFG_IN:
+            print('PS/PL TAP state = {} DR = 0x{:08x}'.format(dr_state, dr_value))
+        else:
+            print('PS/PL TAP state = {}'.format(dr_state))
+            print('Bitstream command bit len = {}'.format(len(dr_value)))
 
+            for idx, byte in enumerate(bits_to_bytes(dr_value)):
+                if idx % 16 == 0:
+                    print('{:04x}'.format(idx), end=' ')
+
+                print('{:02x}'.format(byte), end=' ')
+
+                if (idx % 16) == 15:
+                    print()
+
+            print()
 
     dap_model = UscaleDapModel(dap_callback)
     ps_model = UscalePsModel(dap_model, ps_callback)
@@ -952,25 +1037,28 @@ def main():
     jtag_fsm = JtagFsm(jtag_model)
 
     for idx, cmd in enumerate(ftdi_commands):
-        print('{: 8d} {:24s} opcode=0x{:02x} cf={: 8d} l={}'.format(
-            idx,
-            cmd.type.name,
-            cmd.opcode,
-            cmd.command_frame,
-            cmd.length))
+        if DEBUG_JTAG_SIM:
+            print('{: 8d} {:24s} opcode=0x{:02x} cf={: 8d} l={}'.format(
+                idx,
+                cmd.type.name,
+                cmd.opcode,
+                cmd.command_frame,
+                cmd.length))
 
-        if cmd.type == FtdiCommandType.FLUSH:
-            for _ in range(3):
-                print('*** FLUSH ***')
-        if cmd.flags is not None:
-            print('Flags: [{}]'.format(', '.join(flag.name for flag in cmd.flags)))
-        if cmd.data is not None:
-            print('Command: {}'.format(':'.join('{:02x}'.format(b) for b in cmd.data)))
+            if cmd.type == FtdiCommandType.FLUSH:
+                for _ in range(3):
+                    print('*** FLUSH ***')
+            if cmd.flags is not None:
+                print('Flags: [{}]'.format(', '.join(flag.name for flag in cmd.flags)))
+            if cmd.data is not None:
+                print('Command: {}'.format(':'.join('{:02x}'.format(b) for b in cmd.data)))
 
         output = run_ftdi_command(cmd, jtag_fsm)
-        if cmd.reply is not None:
-            print('Real Reply(rf={: 8d}): {}'.format(cmd.reply_frame, ':'.join('{:02x}'.format(b) for b in cmd.reply)))
-            print(' Sim Reply    {:8s} : {}'.format('', ':'.join('{:02x}'.format(b) for b in output)))
+
+        if DEBUG_JTAG_SIM:
+            if cmd.reply is not None:
+                print('Real Reply(rf={: 8d}): {}'.format(cmd.reply_frame, ':'.join('{:02x}'.format(b) for b in cmd.reply)))
+                print(' Sim Reply    {:8s} : {}'.format('', ':'.join('{:02x}'.format(b) for b in output)))
 
 
 if __name__ == "__main__":
