@@ -5,8 +5,15 @@ import json
 
 
 FTDI_MAX_PACKET_SIZE = 512
-HEX_DISPLAY = False
+
+# All debugging statements, other than DRSHIFT and IRSHIFT.
 DEBUG_JTAG_SIM = False
+
+# If DEBUG_JTAG_SIM is True, prints DRSHIFT transitions as well
+DEBUG_JTAG_SIM_DRSHIFT = False
+
+# If DEBUG_JTAG_SIM is True, prints IRSHIFT transitions as well
+DEBUG_JTAG_SIM_IRSHIFT = False
 
 
 class FtdiCommandType(Enum):
@@ -190,14 +197,6 @@ def decode_commands(ftdi_bytes, ftdi_replies):
             reply_frame = ftdi_replies.current_frame()
         else:
             reply_frame = None
-
-
-        if HEX_DISPLAY:
-            command_opcode = hex(command_opcode)
-            if data is not None:
-                data = tuple(hex(b) for b in data)
-            if reply is not None:
-                reply = tuple(hex(b) for b in reply)
 
         ftdi_commands.append(FtdiCommand(
             type=command_type,
@@ -444,13 +443,14 @@ class DrState(Enum):
     JPROGRAM = 18
     ISC_NOOP = 19
     FUSE_DNA = 20
+    JSTART = 21
 
 
 class UscaleDapModel(object):
-    def __init__(self, dap_cb):
+    def __init__(self, dr_cb):
         self.ir = ShiftRegister(4)
         self.dr = None
-        self.dap_cb = dap_cb
+        self.dr_cb = dr_cb
 
         # DAP states in BYPASS until enabled
         self.dap_state = DrState.BYPASS
@@ -469,7 +469,7 @@ class UscaleDapModel(object):
     def update_dr(self):
         """ DR update state has been entered. """
         dr = self.dr.read()
-        self.dap_cb(self.dap_state, dr)
+        self.dr_cb(self.dap_state, dr)
 
     def capture_ir(self):
         """ IR update state has been entered. """
@@ -531,15 +531,20 @@ class UscaleDapModel(object):
     def set_enable(self, enable):
         self.will_enable = enable
 
+    def run_idle(self):
+        """ Run-test/idle state has been entered. """
+        pass
+
 
 class UscalePsModel(object):
-    def __init__(self, dap_model, ps_callback):
+    def __init__(self, dap_model, dr_cb, ir_cb):
         self.dap_model = dap_model
         self.ir = ShiftRegister(12)
         self.captured_ir = None
         self.dr = None
         self.dr_state = DrState.IDCODE
-        self.ps_callback = ps_callback
+        self.ir_cb = ir_cb
+        self.dr_cb = dr_cb
 
     def shift_dr(self, tdi):
         """ DR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
@@ -557,10 +562,11 @@ class UscalePsModel(object):
             if dr & 0x2:
                 self.dap_model.set_enable(True)
 
-        self.ps_callback(self.dr_state, self.capture_ir, dr)
+        self.dr_cb(self.dr_state, self.capture_ir, dr)
 
     def capture_ir(self):
         """ IR update state has been entered. """
+
         if DEBUG_JTAG_SIM:
             print('PS TAP IR = 0x01')
         self.ir.load(0x51)
@@ -598,7 +604,10 @@ class UscalePsModel(object):
         elif self.dr_state == DrState.CFG_IN:
             self.dr = SinkRegister()
         elif self.dr_state == DrState.JPROGRAM:
-            # No DRCAPTURE with ISC_NOOP
+            # No DRCAPTURE with JPROGRAM
+            assert False, self.dr_state
+        elif self.dr_state == DrState.JSTART:
+            # No DRCAPTURE with JPROGRAM
             assert False, self.dr_state
         elif self.dr_state == DrState.ISC_NOOP:
             # No DRCAPTURE with ISC_NOOP
@@ -608,7 +617,7 @@ class UscalePsModel(object):
         elif self.dr_state == DrState.ERROR_STATUS:
             self.dr = ShiftRegister(121)
         elif self.dr_state == DrState.FUSE_DNA:
-            self.dr = ShiftRegister(1)
+            self.dr = ShiftRegister(96)
         else:
             assert False, self.dr_state
 
@@ -647,13 +656,26 @@ class UscalePsModel(object):
                 self.dr_state = DrState.CFG_IN
             elif pl_ir == 0b001011:
                 self.dr_state = DrState.JPROGRAM
+
+                # Because there is no DRCAPTURE for JSTART, emit ir_cb
+                self.ir_cb(DrState.JPROGRAM)
+            elif pl_ir == 0b001100:
+                self.dr_state = DrState.JSTART
+
+                # Because there is no DRCAPTURE for JSTART, emit ir_cb
+                self.ir_cb(DrState.JSTART)
             elif pl_ir == 0b010100:
                 self.dr_state = DrState.ISC_NOOP
+
+                # Because there is no DRCAPTURE for JSTART, emit ir_cb
+                self.ir_cb(DrState.ISC_NOOP)
             elif pl_ir == 0b100010:
                 self.dr_state = DrState.USER3
             elif pl_ir == 0b100011:
                 self.dr_state = DrState.USER4
             elif pl_ir == 0b110010:
+                # Table 8-3 eFUSE-Related JTAG Instructions from UG570
+                # Page 133
                 self.dr_state = DrState.FUSE_DNA
             else:
                 assert False, hex(pl_ir)
@@ -681,6 +703,10 @@ class UscalePsModel(object):
     def reset(self):
         self.dr_state = DrState.IDCODE
         self.captured_ir = None
+
+    def run_idle(self):
+        """ Run-test/idle state has been entered. """
+        pass
 
 
 class JtagBypassModel(object):
@@ -712,6 +738,11 @@ class JtagBypassModel(object):
         pass
 
     def reset(self):
+        """ Reset state has been entered. """
+        pass
+
+    def run_idle(self):
+        """ Run-test/idle state has been entered. """
         pass
 
 
@@ -761,6 +792,11 @@ class JtagChain(object):
         for model in self.models:
             model.reset()
 
+    def run_idle(self):
+        """ Run-test/idle state has been entered. """
+        for model in self.models:
+            model.run_idle()
+
 
 class JtagFsm(object):
     def __init__(self, jtag_model):
@@ -782,10 +818,18 @@ class JtagFsm(object):
         assert not self.pins_locked
         next_state = JTAG_STATE_TABLE[self.state, tms]
         if DEBUG_JTAG_SIM:
-            print(self.state, tdi)
+            if self.state == JtagState.DRSHIFT and DEBUG_JTAG_SIM_DRSHIFT:
+                print(self.state, tdi)
+            elif self.state == JtagState.DRSHIFT and DEBUG_JTAG_SIM_IRSHIFT:
+                print(self.state, tdi)
+            else:
+                print(self.state, tdi)
+
 
         if self.state == JtagState.RESET:
             self.jtag_model.reset()
+        elif self.state == JtagState.RUN_IDLE:
+            self.jtag_model.run_idle()
         elif self.state == JtagState.DRSHIFT:
             self.last_tdo = self.jtag_model.shift_dr(tdi)
         elif self.state == JtagState.DRUPDATE:
@@ -1011,7 +1055,7 @@ def main():
         if dr_state != DrState.BYPASS:
             print('ARM DAP TAP state = {} DR = 0x{:09x}'.format(dr_state, dr_value))
 
-    def ps_callback(dr_state, ir_value, dr_value):
+    def ps_dr_callback(dr_state, ir_value, dr_value):
         if dr_state == DrState.BYPASS:
             return
         elif dr_state != DrState.CFG_IN:
@@ -1031,8 +1075,11 @@ def main():
 
             print()
 
-    dap_model = UscaleDapModel(dap_callback)
-    ps_model = UscalePsModel(dap_model, ps_callback)
+    def ps_ir_callback(dr_state):
+        print('PL TAP state = {}'.format(dr_state))
+
+    dap_model = UscaleDapModel(dr_cb=dap_callback)
+    ps_model = UscalePsModel(dap_model, ir_cb=ps_ir_callback, dr_cb=ps_dr_callback)
     jtag_model = JtagChain(models=[ps_model, dap_model])
     jtag_fsm = JtagFsm(jtag_model)
 
