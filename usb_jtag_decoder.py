@@ -15,6 +15,7 @@ DEBUG_JTAG_SIM_DRSHIFT = False
 # If DEBUG_JTAG_SIM is True, prints IRSHIFT transitions as well
 DEBUG_JTAG_SIM_IRSHIFT = False
 
+PRINT_BITSTREAM = False
 
 class FtdiCommandType(Enum):
     # Command type is unknown
@@ -562,7 +563,7 @@ class UscalePsModel(object):
             if dr & 0x2:
                 self.dap_model.set_enable(True)
 
-        self.dr_cb(self.dr_state, self.capture_ir, dr)
+        self.dr_cb(self.dr_state, self.captured_ir, dr)
 
     def capture_ir(self):
         """ IR update state has been entered. """
@@ -587,6 +588,8 @@ class UscalePsModel(object):
         elif self.dr_state == DrState.JTAG_STATUS:
             self.dr = ShiftRegister(32)
         elif self.dr_state == DrState.PS_IDCODE_DEVICE_ID:
+            # This appears to never be read, so emit ir_cb
+            self.ir_cb(DrState.PS_IDCODE_DEVICE_ID)
             self.dr = ShiftRegister(64)
             self.dr.load((0x14710093 << 32) | 0x0)
         elif self.dr_state == DrState.IP_DISABLE:
@@ -642,6 +645,7 @@ class UscalePsModel(object):
             # This state is entered in the IR, but DRCAPTURE is never entered
             # with this IR.
             self.dr_state = DrState.UNKNOWN_STATE_9FF
+            self.ir_cb(DrState.UNKNOWN_STATE_9FF)
         elif ps_ir == 0x24:
             # PL in control
             # Table 6-3 UltraScale FPGA Boundary-Scan Instructions from UG570
@@ -966,11 +970,410 @@ def run_ftdi_command(command, jtag_fsm):
 
     return tuple(bits_to_bytes(output))
 
+class ArmDebugCommand(Enum):
+    # irscan ABORT ; drscan 35 <value>
+    ABORT = 0
+    # dap apreg <ap_num> <reg>
+    READ_AP_REGISTER = 1
+    # dap apreg <ap_num> <reg> <value>
+    WRITE_AP_REGISTER = 2
+    # dap dpreg <reg>
+    READ_DP_REGISTER = 3
+    # dap dpreg <reg> <value>
+    WRITE_DP_REGISTER = 4
+
+# DPACC address map
+# Table 2-6 DPv2 address map from
+# ARM Debug Interface Architecture Specification ADIv5.0 to ADIv5.2
+# Page 2-43
+class ArmDpRegister(Enum):
+    DPIDR = 0x0
+    CTRL_STAT = 0x4
+    DLCR = 0x14
+    TARGETID = 0x24
+    DLPIDR = 0x34
+    EVENTSTAT = 0x44
+    SELECT = 0x8
+    RDBUFF = 0xC
+
+class ArmDebugModel():
+    def __init__(self, callback):
+        self.callback = callback
+        self.apsel = None
+        self.apbanksel = 0
+        self.dpbanksel = 0
+
+    def dr_access(self, dr_state, dr_value):
+        if dr_state == DrState.ABORT:
+            self.callback(command=ArmDebugCommand.ABORT, value=dr_value)
+        elif dr_state == DrState.IDCODE:
+            pass
+        elif dr_state == DrState.BYPASS:
+            pass
+        elif dr_state == DrState.APACC or dr_state == DrState.DPACC:
+            RnW = dr_value & 0x1 != 0
+            A = ((dr_value >> 1) & 0x3) << 2
+            datain = (dr_value >> 3) & 0xFFFFFFFF
+
+            # DPACC address map
+            # Table 2-6 DPv2 address map from
+            # ARM Debug Interface Architecture Specification ADIv5.0 to ADIv5.2
+            # Page 2-43
+            if dr_state == DrState.DPACC and A == 0x0:
+                # DPIDR is RO
+                assert RnW == 1, (dr_state, hex(dr_value))
+                self.callback(command=ArmDebugCommand.READ_DP_REGISTER, reg=A)
+            elif dr_state == DrState.DPACC and A == 0x8:
+                # SELECT is WO
+                assert RnW == 0, (dr_state, hex(dr_value))
+                self.apsel = (datain >> 24)
+                self.dpbanksel = datain & 0xF
+                self.apbanksel = (datain >> 4) & 0xF
+            elif dr_state == DrState.DPACC and A == 0x4:
+                dpreg = (self.dpbanksel << 4) | A
+                if RnW:
+                    # Read
+                    self.callback(command=ArmDebugCommand.READ_DP_REGISTER, reg=dpreg)
+                else:
+                    # Write
+                    self.callback(command=ArmDebugCommand.WRITE_DP_REGISTER, reg=dpreg, value=datain)
+            elif dr_state == DrState.DPACC and A == 0xC:
+                # RDBUFF is RO
+                assert RnW == 1, (dr_state, hex(dr_value))
+                self.callback(command=ArmDebugCommand.READ_DP_REGISTER, reg=A)
+            elif dr_state == DrState.APACC:
+                apreg = (self.apbanksel << 4) | A
+                if RnW:
+                    # Read
+                    self.callback(command=ArmDebugCommand.READ_AP_REGISTER, ap_num=self.apsel, reg=apreg)
+                else:
+                    # Write
+                    self.callback(command=ArmDebugCommand.WRITE_AP_REGISTER, ap_num=self.apsel, reg=apreg, value=datain)
+            else:
+                assert False, (dr_state, hex(dr_value))
+        else:
+            assert False, (dr_state, hex(dr_value))
+
+# Table 7-6 Summary of Memory Access Port (MEM-AP) registers from IHI0031C
+class ArmMemApRegister(Enum):
+    CSW = 0x0
+    TAR = 0x4
+    TAR_HIGH = 0x8
+    DRW = 0xC
+    BD0 = 0x10
+    BD1 = 0x14
+    BD2 = 0x18
+    BD3 = 0x1C
+    MBT = 0x20
+    BASE = 0xF0
+    CFG = 0xF4
+    BASE_HIGH = 0xF8
+    IDR = 0xFC
+
+# Table 7-1 Summary of AddrInc field values from IHI0031C
+class ArmMemApAutoIncrement(Enum):
+    Off = 0b00
+    Single = 0b01
+    Packed = 0b10
+
+class ArmMemApModel(object):
+    def __init__(self):
+        self.tar_low = None
+        self.tar_high = 0x0
+        self.width = None
+        self.auto_increment = None
+
+    def auto_increment_tar(self):
+        assert self.tar_low is not None
+        assert self.tar_high is not None
+        assert self.width is not None
+        assert self.auto_increment is not None
+
+        if self.auto_increment == ArmMemApAutoIncrement.Off:
+            return ''
+
+        tar = (self.tar_high << 32) | self.tar_low
+
+        if self.auto_increment == ArmMemApAutoIncrement.Single:
+            tar += self.width
+            msg = ', address auto-incremented by {}-bits'.format(self.width*8)
+        elif self.auto_increment == ArmMemApAutoIncrement.Packed:
+            raise NotImplementedError('Packed auto-increment not implemented')
+        else:
+            assert False, self.auto_increment
+
+        self.tar_low = tar & 0xFFFFFFFF
+        self.tar_high = (tar >> 32) & 0xFFFFFFFF
+
+        return msg
+
+    def read_banked(self, offset):
+        assert self.tar_low is not None
+        assert self.tar_high is not None
+        assert self.width == 4
+        assert offset in [0x0, 0x4, 0x8, 0xC]
+
+        tar = (self.tar_high << 32) | self.tar_low
+        address = tar & 0xFFFFFFF0 | offset
+        if self.tar_high == 0:
+            return 'Reading {}-bits from 0x{:08x}'.format(
+                    self.width * 8, address
+                    )
+        else:
+            return 'Reading {}-bits from 0x{:016x}'.format(
+                    self.width * 8, address
+                    )
+
+    def write_banked(self, offset, value):
+        assert self.tar_low is not None
+        assert self.tar_high is not None
+        assert self.width == 4
+        assert offset in [0x0, 0x4, 0x8, 0xC]
+
+        tar = (self.tar_high << 32) | self.tar_low
+        address = tar & 0xFFFFFFF0 | offset
+        if self.tar_high == 0:
+            return 'Writing {}-bits from 0x{:08x} to 0x{:08x}'.format(
+                    self.width * 8, address, value
+                    )
+        else:
+            return 'Writing {}-bits from 0x{:016x} to 0x{:08x}'.format(
+                    self.width * 8, address, value
+                    )
+
+    def read_register(self, reg):
+        reg = ArmMemApRegister(reg)
+
+        if reg == ArmMemApRegister.CSW:
+            return 'Read MEM-AP CSW'
+        elif reg == ArmMemApRegister.TAR:
+            return 'Read MEM-AP TAR[31:0]'
+        elif reg == ArmMemApRegister.TAR_HIGH:
+            return 'Read MEM-AP TAR[63:32]'
+        elif reg == ArmMemApRegister.DRW:
+            assert self.tar_low is not None
+            assert self.tar_high is not None
+            assert self.width is not None
+            assert self.auto_increment is not None
+
+            if self.tar_high == 0:
+                msg = 'Reading {}-bits from 0x{:08x}'.format(
+                        self.width * 8, self.tar_low
+                        )
+            else:
+                tar = (self.tar_high << 32) | self.tar_low
+
+                msg = 'Reading {}-bits from 0x{:016x}'.format(
+                        self.width * 8, tar
+                        )
+
+            msg += self.auto_increment_tar()
+            return msg
+        elif reg == ArmMemApRegister.BD0:
+            return self.read_banked(0x0)
+        elif reg == ArmMemApRegister.BD1:
+            return self.read_banked(0x4)
+        elif reg == ArmMemApRegister.BD2:
+            return self.read_banked(0x8)
+        elif reg == ArmMemApRegister.BD3:
+            return self.read_banked(0xC)
+        elif reg == ArmMemApRegister.MBT:
+            raise NotImplementedError('MBT not implemented')
+        elif reg == ArmMemApRegister.BASE:
+            return 'Read MEM-AP BASE'
+        elif reg == ArmMemApRegister.CFG:
+            return 'Read MEM-AP CFG'
+        elif reg == ArmMemApRegister.BASE_HIGH:
+            return 'Read MEM-AP BASE_HIGH'
+        elif reg == ArmMemApRegister.IDR:
+            return 'Read MEM-AP IDR'
+        else:
+            assert False, reg
+
+    def write_register(self, reg, value):
+        reg = ArmMemApRegister(reg)
+
+        if reg == ArmMemApRegister.CSW:
+            # Table 7-2 Size field values when the MEM-AP supports different
+            # access sizes from IHI0031C
+            op_size = value & 0x7
+            if op_size == 0b000:
+                # 1 byte
+                self.width = 1
+            elif op_size == 0b001:
+                # 2 bytes
+                self.width = 2
+            elif op_size == 0b010:
+                # 4 bytes
+                self.width = 4
+            elif op_size == 0b011:
+                # 8 bytes
+                self.width = 8
+            elif op_size == 0b100:
+                # 16 bytes
+                self.width = 16
+            elif op_size == 0b101:
+                # 32 bytes
+                self.width = 32
+            else:
+                assert False, hex(op_size)
+
+            self.auto_increment = ArmMemApAutoIncrement((value >> 4) & 0x3)
+
+            mode = (value >> 8) & 0xF
+            if mode != 0:
+                raise NotImplementedError('Barrier support not implemented.')
+
+        elif reg == ArmMemApRegister.TAR:
+            self.tar_low = value
+        elif reg == ArmMemApRegister.TAR_HIGH:
+            self.tar_high = value
+        elif reg == ArmMemApRegister.DRW:
+            assert self.tar_low is not None
+            assert self.tar_high is not None
+            assert self.width is not None
+            assert self.auto_increment is not None
+
+            if self.tar_high == 0:
+                msg = 'Writing {}-bits from 0x{:08x} to 0x{:08x}'.format(
+                        self.width * 8, self.tar_low, value,
+                        )
+            else:
+                tar = (self.tar_high << 32) | self.tar_low
+
+                msg = 'Writing {}-bits from 0x{:016x} to 0x{:08x}'.format(
+                        self.width * 8, tar, value
+                        )
+
+            msg += self.auto_increment_tar()
+
+            return msg
+        elif reg == ArmMemApRegister.BD0:
+            return self.write_banked(0x0, value)
+        elif reg == ArmMemApRegister.BD1:
+            return self.write_banked(0x4, value)
+        elif reg == ArmMemApRegister.BD2:
+            return self.write_banked(0x8, value)
+        elif reg == ArmMemApRegister.BD3:
+            return self.write_banked(0xC, value)
+        elif reg == ArmMemApRegister.MBT:
+            raise NotImplementedError('MBT not implemented')
+        elif reg == ArmMemApRegister.BASE:
+            raise RuntimeError('Writing a RO register!')
+        elif reg == ArmMemApRegister.CFG:
+            raise RuntimeError('Writing a RO register!')
+        elif reg == ArmMemApRegister.BASE_HIGH:
+            raise RuntimeError('Writing a RO register!')
+        elif reg == ArmMemApRegister.IDR:
+            raise RuntimeError('Writing a RO register!')
+        else:
+            assert False, reg
+
+# Table 7-6 Summary of Memory Access Port (MEM-AP) registers from IHI0031C
+class ArmJtagApRegister(Enum):
+    CSW = 0x0
+    PSEL = 0x04
+    PSTA = 0x08
+    BxFIFO1 = 0x10
+    BxFIFO2 = 0x14
+    BxFIFO3 = 0x18
+    BxFIFO4 = 0x1C
+    IDR = 0xFC
+
+class ArmJtagApModel(object):
+    def __init__(self):
+        pass
+
+    def read_register(self, reg):
+        reg = ArmJtagApRegister(reg)
+
+        if reg == ArmJtagApRegister.CSW:
+            return 'Read JTAG-AP CSW'
+        elif reg == ArmJtagApRegister.IDR:
+            return 'Read JTAG-AP IDR'
+        else:
+            raise NotImplementedError('Most of JTAG-AP not implemented')
+
+    def write_register(self, reg, value):
+        reg = ArmJtagApRegister(reg)
+
+        if reg == ArmJtagApRegister.CSW:
+            return 'Write JTAG-AP CSW = 0x{:08x}'.format(value)
+        elif reg == ArmJtagApRegister.PSEL:
+            return 'Write JTAG-AP PSEL = 0x{:08x}'.format(value)
+        else:
+            raise NotImplementedError('Most of JTAG-AP not implemented')
+
+class DapOutputGroupers(object):
+    """ Outputs OpenOCD TCL to specified file and groups by result.
+
+    The access point models in self.arm_aps do not always generate a "result",
+    for example writing an MEM-AP TAR (target address) register is not really
+    a result, it is just part of setting up the "real" transaction.
+
+    This class groups TCL commands into actions, with a comment at the top of
+    a command block indicating what the following commands are doing, and then
+    the TCL follows.
+
+    """
+    def __init__(self, f):
+        self.f = f
+        self.lines = []
+        self.ap_names = ["MEM-AP AXI", "MEM-AP Debug", "JTAG-AP"]
+        self.arm_aps = [ArmMemApModel(), ArmMemApModel(), ArmJtagApModel()]
+
+    def openocd_dap_callback(self, command, value=None, reg=None, ap_num=None):
+        if command == ArmDebugCommand.ABORT:
+            print('irscan $_CHIPNAME.tap [dap_ir ABORT]', file=self.f)
+            print('drscan $_CHIPNAME.tap 35 0x{:09x}'.format(value+0), file=self.f)
+            print(file=self.f)
+        elif command == ArmDebugCommand.READ_AP_REGISTER:
+            result = self.arm_aps[ap_num].read_register(reg)
+
+            # Group lines until a result is produced (e.g. a memory
+            # read or write).
+            self.lines.append('set ap_reg_value [$_CHIPNAME.dap apreg {:d} 0x{:02x}]'.format(ap_num+0, reg+0))
+
+            if result is not None:
+                # We know what the DAP result was, add comment as header,
+                # and write out lines
+                print('# {}: {}'.format(self.ap_names[ap_num], result), file=self.f)
+                for l in self.lines:
+                    print(l, file=self.f)
+                print(file=self.f)
+
+                self.lines = []
+        elif command == ArmDebugCommand.WRITE_AP_REGISTER:
+            result = self.arm_aps[ap_num].write_register(reg, value)
+
+            # Group lines until a result is produced (e.g. a memory
+            # read or write).
+            self.lines.append('$_CHIPNAME.dap apreg {:d} 0x{:02x} 0x{:08x}'.format(ap_num+0, reg+0, value+0))
+
+            if result is not None:
+                # We know what the DAP result was, add comment as header,
+                # and write out lines
+                print('# {}: {}'.format(self.ap_names[ap_num], result), file=self.f)
+                for l in self.lines:
+                    print(l, file=self.f)
+                print(file=self.f)
+        elif command == ArmDebugCommand.READ_DP_REGISTER:
+            print('# Reading {}'.format(ArmDpRegister(reg).name), file=self.f)
+            print('set dp_reg_value [$_CHIPNAME.dap dpreg 0x{:02x}]'.format(reg+0), file=self.f)
+            print(file=self.f)
+        elif command == ArmDebugCommand.WRITE_DP_REGISTER:
+            print('# Writing {} = 0x{:08x}'.format(ArmDpRegister(reg).name, value+0), file=self.f)
+            print('$_CHIPNAME.dap dpreg 0x{:02x} 0x{:08x}'.format(reg+0, value+0), file=self.f)
+            print(file=self.f)
+        else:
+            assert False, (command, value, reg, ap_num)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--json_pcap', required=True, help='Input JSON PCAP data')
     parser.add_argument('--ftdi_commands', help='Output of FTDI commands')
+    parser.add_argument('--openocd_script', help='Output of OpenOCD script', required=True)
 
     args = parser.parse_args()
 
@@ -1051,61 +1454,115 @@ def main():
 
             json.dump(outputs, f, indent=2)
 
-    def dap_callback(dr_state, dr_value):
-        if dr_state != DrState.BYPASS:
-            print('ARM DAP TAP state = {} DR = 0x{:09x}'.format(dr_state, dr_value))
 
-    def ps_dr_callback(dr_state, ir_value, dr_value):
-        if dr_state == DrState.BYPASS:
-            return
-        elif dr_state != DrState.CFG_IN:
-            print('PS/PL TAP state = {} DR = 0x{:08x}'.format(dr_state, dr_value))
-        else:
-            print('PS/PL TAP state = {}'.format(dr_state))
-            print('Bitstream command bit len = {}'.format(len(dr_value)))
+    with open(args.openocd_script, 'w') as f:
 
-            for idx, byte in enumerate(bits_to_bytes(dr_value)):
-                if idx % 16 == 0:
-                    print('{:04x}'.format(idx), end=' ')
+        dap_output = DapOutputGroupers(f)
+        arm_debug_model = ArmDebugModel(dap_output.openocd_dap_callback)
 
-                print('{:02x}'.format(byte), end=' ')
+        def dap_callback(dr_state, dr_value):
+            arm_debug_model.dr_access(dr_state, dr_value)
 
-                if (idx % 16) == 15:
-                    print()
+        def ps_dr_callback(dr_state, ir_value, dr_value):
+            if dr_state != DrState.CFG_IN and dr_state != DrState.BYPASS and dr_state != DrState.IDCODE:
+                # DR for CFG_IN is the entire bitstream!
+                # Don't print that!
+                print('# PS/PL IR value = {} TAP state = {} DR = 0x{:08x}'.format('0x{:03x}'.format(ir_value) if ir_value is not None else ir_value, dr_state, dr_value), file=f)
 
-            print()
+            if dr_state == DrState.BYPASS:
+                return
+            elif dr_state == DrState.IDCODE:
+                print('irscan $_CHIPNAME.ps [ps_ir IDCODE]', file=f)
+                print('set idcode [drscan $_CHIPNAME.ps 32]', file=f)
+            elif dr_state == DrState.PMU_MDM:
+                print('irscan $_CHIPNAME.ps [ps_ir PMU_MDM]', file=f)
+                print('set old_pmu_mdm [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.JTAG_STATUS:
+                print('irscan $_CHIPNAME.ps [ps_ir JTAG_STATUS]', file=f)
+                print('set jtag_status [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.JTAG_CTRL:
+                print('irscan $_CHIPNAME.ps [ps_ir JTAG_CTRL]', file=f)
+                print('set old_jtag_ctrl [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.ERROR_STATUS:
+                print('irscan $_CHIPNAME.ps [ps_ir ERROR_STATUS]', file=f)
+                print('set error_status [drscan $_CHIPNAME.ps 121 0x{:033x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.IP_DISABLE:
+                print('irscan $_CHIPNAME.ps [ps_ir IP_DISABLE]', file=f)
+                print('set ip_disable_value [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.USER1:
+                print('irscan $_CHIPNAME.ps [pl_ir USER1]', file=f)
+                print('set user1_value [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.USER2:
+                print('irscan $_CHIPNAME.ps [pl_ir USER2]', file=f)
+                print('set user2_value [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.USER3:
+                print('irscan $_CHIPNAME.ps [pl_ir USER3]', file=f)
+                print('set user3_value [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.FUSE_DNA:
+                print('irscan $_CHIPNAME.ps [pl_ir FUSE_DNA]', file=f)
+                print('set user3_value [drscan $_CHIPNAME.ps 96 0x{:024x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.CFG_OUT:
+                print('irscan $_CHIPNAME.ps [pl_ir CFG_OUT]', file=f)
+                print('set user3_value [drscan $_CHIPNAME.ps 32 0x{:08x}]'.format(dr_value), file=f)
+            elif dr_state == DrState.CFG_IN:
+                print('# PS/PL TAP state = {}'.format(dr_state), file=f)
+                print('# Bitstream command bit len = {}'.format(len(dr_value)), file=f)
+                print('pld load 0 xxx.bit', file=f)
 
-    def ps_ir_callback(dr_state):
-        print('PL TAP state = {}'.format(dr_state))
+                if PRINT_BITSTREAM:
+                    for idx, byte in enumerate(bits_to_bytes(dr_value)):
+                        if idx % 16 == 0:
+                            print('{:04x}'.format(idx), end=' ')
 
-    dap_model = UscaleDapModel(dr_cb=dap_callback)
-    ps_model = UscalePsModel(dap_model, ir_cb=ps_ir_callback, dr_cb=ps_dr_callback)
-    jtag_model = JtagChain(models=[ps_model, dap_model])
-    jtag_fsm = JtagFsm(jtag_model)
+                        print('{:02x}'.format(byte), end=' ')
 
-    for idx, cmd in enumerate(ftdi_commands):
-        if DEBUG_JTAG_SIM:
-            print('{: 8d} {:24s} opcode=0x{:02x} cf={: 8d} l={}'.format(
-                idx,
-                cmd.type.name,
-                cmd.opcode,
-                cmd.command_frame,
-                cmd.length))
+                        if (idx % 16) == 15:
+                            print()
 
-            if cmd.type == FtdiCommandType.FLUSH:
-                for _ in range(3):
-                    print('*** FLUSH ***')
-            if cmd.flags is not None:
-                print('Flags: [{}]'.format(', '.join(flag.name for flag in cmd.flags)))
-            if cmd.data is not None:
-                print('Command: {}'.format(':'.join('{:02x}'.format(b) for b in cmd.data)))
+            else:
+                assert False, dr_state
 
-        output = run_ftdi_command(cmd, jtag_fsm)
+            print(file=f)
 
-        if DEBUG_JTAG_SIM:
-            if cmd.reply is not None:
-                print('Real Reply(rf={: 8d}): {}'.format(cmd.reply_frame, ':'.join('{:02x}'.format(b) for b in cmd.reply)))
-                print(' Sim Reply    {:8s} : {}'.format('', ':'.join('{:02x}'.format(b) for b in output)))
+        def ps_ir_callback(dr_state):
+            print('# PL TAP state = {}'.format(dr_state.name), file=f)
+            if dr_state == DrState.PS_IDCODE_DEVICE_ID:
+                print('irscan $_CHIPNAME.ps 0x249', file=f)
+            elif dr_state == DrState.UNKNOWN_STATE_9FF:
+                print('irscan $_CHIPNAME.ps 0x9ff', file=f)
+            else:
+                print('irscan $_CHIPNAME.ps [pl_ir {}]'.format(dr_state.name), file=f)
+            print(file=f)
+
+        dap_model = UscaleDapModel(dr_cb=dap_callback)
+        ps_model = UscalePsModel(dap_model, ir_cb=ps_ir_callback, dr_cb=ps_dr_callback)
+        jtag_model = JtagChain(models=[ps_model, dap_model])
+        jtag_fsm = JtagFsm(jtag_model)
+
+        print('Running JTAG simulation')
+        for idx, cmd in enumerate(ftdi_commands):
+            if DEBUG_JTAG_SIM:
+                print('{: 8d} {:24s} opcode=0x{:02x} cf={: 8d} l={}'.format(
+                    idx,
+                    cmd.type.name,
+                    cmd.opcode,
+                    cmd.command_frame,
+                    cmd.length))
+
+                if cmd.type == FtdiCommandType.FLUSH:
+                    for _ in range(3):
+                        print('*** FLUSH ***')
+                if cmd.flags is not None:
+                    print('Flags: [{}]'.format(', '.join(flag.name for flag in cmd.flags)))
+                if cmd.data is not None:
+                    print('Command: {}'.format(':'.join('{:02x}'.format(b) for b in cmd.data)))
+
+            output = run_ftdi_command(cmd, jtag_fsm)
+
+            if DEBUG_JTAG_SIM:
+                if cmd.reply is not None:
+                    print('Real Reply(rf={: 8d}): {}'.format(cmd.reply_frame, ':'.join('{:02x}'.format(b) for b in cmd.reply)))
+                    print(' Sim Reply    {:8s} : {}'.format('', ':'.join('{:02x}'.format(b) for b in output)))
 
 
 if __name__ == "__main__":
