@@ -406,12 +406,29 @@ class DrState(Enum):
     IDCODE = 1
     JTAG_CTRL = 2
     JTAG_STATUS = 3
+    ABORT = 4
+    DPACC = 5
+    APACC = 6
+    PS_IDCODE_DEVICE_ID = 7
+    PMU_MBM = 8
+    ERROR_STATUS = 9
+    IP_DISABLE = 10
+    UNKNOWN_STATE_9FF = 11
+    USER1 = 12
+    USER2 = 13
+    USER3 = 14
+    USER4 = 15
+    CFG_OUT = 16
+    CFG_IN = 17
+    JPROGRAM = 18
+    ISC_NOOP = 19
 
 
 class UscaleDapModel(object):
-    def __init__(self):
+    def __init__(self, dap_cb):
         self.ir = ShiftRegister(4)
         self.dr = None
+        self.dap_cb = dap_cb
 
         # DAP states in BYPASS until enabled
         self.dap_state = DrState.BYPASS
@@ -430,8 +447,7 @@ class UscaleDapModel(object):
     def update_dr(self):
         """ DR update state has been entered. """
         dr = self.dr.read()
-        print('DAP TAP state = {} DR = 0x{:08x}'.format(self.dap_state, dr))
-        pass
+        self.dap_cb(self.dap_state, dr)
 
     def capture_ir(self):
         """ IR update state has been entered. """
@@ -447,6 +463,12 @@ class UscaleDapModel(object):
         elif self.dap_state == DrState.IDCODE:
             self.dr = ShiftRegister(32)
             self.dr.load(0x5ba00477)
+        elif self.dap_state == DrState.ABORT:
+            self.dr = ShiftRegister(35)
+        elif self.dap_state == DrState.DPACC:
+            self.dr = ShiftRegister(35)
+        elif self.dap_state == DrState.APACC:
+            self.dr = ShiftRegister(35)
         else:
             assert False, self.dap_state
 
@@ -455,24 +477,25 @@ class UscaleDapModel(object):
         ir = self.ir.read()
         if self.enable:
             if ir == 0x1:
-                # ABORT?
-                pass
+                self.dap_state = DrState.ABORT
             elif ir == 0b1010:
-                # DPACC
-                pass
+                self.dap_state = DrState.DPACC
             elif ir == 0b1011:
                 # APACC
-                pass
+                self.dap_state = DrState.APACC
             elif ir == 0b1110:
                 # IDCODE
                 self.dap_state = DrState.IDCODE
+            elif ir == 0b1111:
+                self.dap_state = DrState.BYPASS
             else:
                 # All other IR's are BYPASS
+                print('ARM TAP IR *** UNKNOWN! ***, setting BYPASS')
                 self.dap_state = DrState.BYPASS
         else:
             self.dap_state = DrState.BYPASS
 
-        print('ARM TAP IR = 0x{:02x}, state = {}'.format(ir, self.dap_state))
+        print('ARM TAP IR = 0x{:01x}, state = {}'.format(ir, self.dap_state))
 
     def reset(self):
         if self.will_enable:
@@ -487,11 +510,13 @@ class UscaleDapModel(object):
 
 
 class UscalePsModel(object):
-    def __init__(self, dap_model):
+    def __init__(self, dap_model, ps_callback):
         self.dap_model = dap_model
         self.ir = ShiftRegister(12)
+        self.captured_ir = None
         self.dr = None
         self.dr_state = DrState.IDCODE
+        self.ps_callback = ps_callback
 
     def shift_dr(self, tdi):
         """ DR shift state has been entered, tdi is state of TDI pin, return state of TDO pin """
@@ -504,10 +529,12 @@ class UscalePsModel(object):
     def update_dr(self):
         """ DR update state has been entered. """
         dr = self.dr.read()
-        print('PS TAP state = {} DR = 0x{:08x}'.format(self.dr_state, dr))
+
         if self.dr_state == DrState.JTAG_CTRL:
             if dr & 0x2:
                 self.dap_model.set_enable(True)
+
+        self.ps_callback(self.dr_state, self.capture_ir, dr)
 
     def capture_ir(self):
         """ IR update state has been entered. """
@@ -535,45 +562,51 @@ class UscalePsModel(object):
     def update_ir(self):
         """ IR update state has been entered. """
         raw_ir = self.ir.read()
-        ir = (raw_ir >> 6)
-        if ir == 0x00:
-            # Reserved
-            assert False, hex(ir)
-        elif ir == 0x03:
-            # PMU_MDM
-            assert False, hex(ir)
-        elif ir == 0x08:
-            # USERCODE
-            assert False, hex(ir)
+        print('PS TAP, raw IR = 0x{:03x} High 6: 0x{:02x} Low 6: 0x{:02x}'.format(
+            raw_ir, (raw_ir >> 6) & 0x3f, raw_ir & 0x3f))
+        self.captured_ir = raw_ir
+        ir = (raw_ir >> 6) & 0x3f
+        if False:
+            pass
+        #if ir == 0x00:
+        #    # Reserved
+        #    assert False, hex(ir)
+        #elif ir == 0x03:
+        #    # PMU_MDM
+        #    assert False, hex(ir)
+        #elif ir == 0x08:
+        #    # USERCODE
+        #    assert False, hex(ir)
         elif ir == 0x09:
             # IDCODE
             self.dr_state = DrState.IDCODE
-        elif ir == 0x0A:
-            # HIGHZ
-            assert False, hex(ir)
-        elif ir == 0x19:
-            # IP_DISABLE
-            assert False, hex(ir)
+        #elif ir == 0x0A:
+        #    # HIGHZ
+        #    assert False, hex(ir)
+        #elif ir == 0x19:
+        #    # IP_DISABLE
+        #    assert False, hex(ir)
         elif ir == 0x1F:
             # JTAG_STATUS
             self.dr_state = DrState.JTAG_STATUS
         elif ir == 0x20:
             self.dr_state = DrState.JTAG_CTRL
-        elif ir == 0x26:
-            # EXTEST
-            assert False, hex(ir)
-        elif ir == 0x26:
-            # EXTEST
-            assert False, hex(ir)
+        elif ir == 0x24:
+            print('PS TAP, weird JTAG_CTRL???')
+            self.dr_state = DrState.JTAG_CTRL
+        #elif ir == 0x26:
+        #    # EXTEST
+        #    assert False, hex(ir)
         elif ir == 0x3F:
             self.dr_state = DrState.BYPASS
         else:
-            assert False, hex(ir)
+            self.dr_state = DrState.BYPASS
 
-        print('PS TAP IR = 0x{:02x}, state = {}'.format(ir, self.dr_state))
+        print('PS TAP IR = 0x{:03x}, state = {}'.format(ir, self.dr_state))
 
     def reset(self):
         self.dr_state = DrState.IDCODE
+        self.captured_ir = None
 
 
 class JtagBypassModel(object):
@@ -901,17 +934,34 @@ def main():
 
             json.dump(outputs, f, indent=2)
 
-    dap_model = UscaleDapModel()
-    ps_model = UscalePsModel(dap_model)
+    def dap_callback(dr_state, dr_value):
+        print('ARM DAP TAP state = {} DR = 0x{:09x}'.format(dr_state, dr_value))
+
+    def ps_callback(dr_state, ir_value, dr_value):
+        print('PS TAP state = {} DR = 0x{:08x}'.format(dr_state, dr_value))
+        if ir_value is not None:
+            print('PS TAP, raw IR = 0x{:03x} High 6: 0x{:02x} Low 6: 0x{:02x}'.format(
+                ir_value,
+                (ir_value >> 6) & 0x3f,
+                ir_value & 0x3f))
+
+
+    dap_model = UscaleDapModel(dap_callback)
+    ps_model = UscalePsModel(dap_model, ps_callback)
     jtag_model = JtagChain(models=[ps_model, dap_model])
     jtag_fsm = JtagFsm(jtag_model)
 
-    for cmd in ftdi_commands[:1000]:
-        print('{:24s} opcode=0x{:02x} cf={: 8d} l={}'.format(
+    for idx, cmd in enumerate(ftdi_commands):
+        print('{: 8d} {:24s} opcode=0x{:02x} cf={: 8d} l={}'.format(
+            idx,
             cmd.type.name,
             cmd.opcode,
             cmd.command_frame,
             cmd.length))
+
+        if cmd.type == FtdiCommandType.FLUSH:
+            for _ in range(3):
+                print('*** FLUSH ***')
         if cmd.flags is not None:
             print('Flags: [{}]'.format(', '.join(flag.name for flag in cmd.flags)))
         if cmd.data is not None:
