@@ -7,11 +7,30 @@ Use wireshark to export parsed FTDI frames from a USB capture to JSON
 (File -> Export Packet Dissections -> As JSON ...).  `usb_jtag_decoder.py`
 takes input as `--json_pcap <input file>`. `usb_jtag_decoder.py` can generate
 the following output:
- - `--ftdi_commands <output JSON>`
- - `--openocd_script <output TCL>`
+ - Output decoded FTDI commands to JSON with `--ftdi_commands <output JSON>`
+ - Print the state of the JTAG simulation with the following flags:
+    - `--print_transitions` - Print JTAG transitions, except for DRSHIFT and
+      IRSHIFT.
+    - `--print_dr_shift` -- Print JTAG DRSHIFT transitions if
+      `--print_transitions` is supplied.
+    - `--print_ir_shift` -- Print JTAG IRSHIFT transitions if
+      `--print_transitions` is supplied.
 
 This decoder assumes FTDI chip has the JTAG interface on interface A, with
 pin 0 as TCK, pin 1 as TDI, pin 2 as TDO, and pin 3 as TMS.
+
+## JTAG models
+
+Simply converting JTAG signals into JTAG state transitions is not immediately
+useful on its own.  However to decode any further requires a particular JTAG
+chain to be modelled.  This repository provides a simple model of the Zynq
+UltraScale+ MPSoC JTAG chain.  This model can by invoking
+`usb_jtag_zynq_mpsoc_decoder.py`.  The `--json_pcap` argument is the same as
+before.  The output of the decoder is sent to the file specified by 
+`--openocd_script`.   This output is an approximation of an OpenOCD script
+issuing commands to the target.
+
+## Notes on USB capture
 
 ### USB capture on Linux
 
