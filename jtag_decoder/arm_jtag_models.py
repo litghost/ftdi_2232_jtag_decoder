@@ -3,6 +3,33 @@ from .registers import ShiftRegister
 from .dr_states import DrState
 
 class ArmDapJtagModel(object):
+    """ Model ARM DAP JTAG TAP.
+
+    Documentation can be found in:
+      Table 3-209: JTAG-DP register summary from ARM DDI0480F
+      Table 2-6: DPv2 address map from ARM IHI0031C
+      Section 6.2: Selecting and accessing an AP from ARM IHI0031C
+
+    Parameters
+    ----------
+    dr_cb : Callable, arguments are DrState Enum and value of DR register.
+        This callback will be invoked whenever the DRUPDATE JTAG state is entered
+        with the state of the IR register in the DrState Enum and the current
+        value stored in the DR shift register.
+
+        The DR shift register will be the correct width based on the value of
+        DrState.
+
+    initial_will_enable : bool
+        If true, then the ARM DAP will initialize upon entering the RESET JTAG
+        state, otherwise it will remain disabled.  In the disabled state, the
+        IR is permanently setting to BYPASS.
+
+    verbose : bool
+        If true, some prints to stdout will be enabled indicating the behavior
+        of the ARM DAP.
+
+    """
     def __init__(self, dr_cb, initial_will_enable=False, verbose=False):
         self.ir = ShiftRegister(4)
         self.dr = None
